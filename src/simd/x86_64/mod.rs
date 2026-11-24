@@ -329,6 +329,30 @@ pub(crate) unsafe fn avx2_downsample_h2v2_plane(
     }
 }
 
+// VPSHUFB works within each 128-bit lane. Each source row is repeated in
+// both lanes, and a mask selects that row's coefficients for a zigzag chunk.
+// Slots owned by other rows are zeroed by PSHUFB and combined with OR.
+const ZIGZAG_SHUFFLES: [[Option<[u8; 32]>; 8]; 4] = {
+    let mut shuffles = [[None; 8]; 4];
+    let mut destination = 0;
+    while destination < 64 {
+        let source = crate::common::tables::ZIGZAG_ORDER[destination];
+        let chunk = destination / 16;
+        let row = source / 8;
+        if shuffles[chunk][row].is_none() {
+            shuffles[chunk][row] = Some([0x80; 32]);
+        }
+        if let Some(mask) = &mut shuffles[chunk][row] {
+            let byte = ((source % 8) * 2) as u8;
+            let lane = (destination % 16) * 2;
+            mask[lane] = byte;
+            mask[lane + 1] = byte + 1;
+        }
+        destination += 1;
+    }
+    shuffles
+};
+
 /// AVX2 quantization: adaptive-precision reciprocal multiply matching C libjpeg-turbo.
 ///
 /// Uses three pre-computed tables per element (from `compute_reciprocal`):
@@ -345,33 +369,52 @@ pub(crate) unsafe fn avx2_downsample_h2v2_plane(
 unsafe fn avx2_quantize_zigzag(coeffs: &[i16; 64], quant: &QuantDivisors, output: &mut [i16; 64]) {
     use core::arch::x86_64::*;
 
-    let zigzag = &crate::common::tables::ZIGZAG_ORDER;
-
-    for i in (0..64).step_by(16) {
-        // Gather 16 coefficients from natural order into zigzag order
-        let mut coeff_buf = [0i16; 16];
-        for j in 0..16 {
-            // SAFETY: ZIGZAG_ORDER contains values in 0..64, and coeffs has exactly 64 elements.
-            coeff_buf[j] = *coeffs.get_unchecked(zigzag[i + j]);
-        }
-        let c: __m256i = _mm256_loadu_si256(coeff_buf.as_ptr() as *const __m256i);
-
-        // Load zigzag-ordered correction, reciprocal, and scale tables
-        let corr: __m256i =
-            _mm256_loadu_si256(quant.corrections_zigzag.as_ptr().add(i) as *const __m256i);
-        let recip: __m256i =
-            _mm256_loadu_si256(quant.reciprocals_zigzag.as_ptr().add(i) as *const __m256i);
-        let scale: __m256i =
-            _mm256_loadu_si256(quant.scales_zigzag.as_ptr().add(i) as *const __m256i);
-
-        let abs_c: __m256i = _mm256_abs_epi16(c);
-        let corrected: __m256i = _mm256_add_epi16(abs_c, corr); // abs + correction
-        let step1: __m256i = _mm256_mulhi_epu16(corrected, recip); // * reciprocal >> 16
-        let step2: __m256i = _mm256_mulhi_epu16(step1, scale); // * scale >> 16
-
-        // Restore sign: vpsignw(result, original) — zero stays zero, sign matched otherwise
-        let result: __m256i = _mm256_sign_epi16(step2, c);
-
-        _mm256_storeu_si256(output.as_mut_ptr().add(i) as *mut __m256i, result);
+    let mut rows = [_mm256_setzero_si256(); 8];
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        let samples = _mm_loadu_si128(coeffs.as_ptr().add(8 * row_index).cast());
+        *row = _mm256_broadcastsi128_si256(samples);
     }
+
+    macro_rules! quantize_chunk {
+        ($chunk:literal) => {{
+            let i = $chunk * 16;
+            let mut c = _mm256_setzero_si256();
+            for (row, mask) in rows.iter().zip(&ZIGZAG_SHUFFLES[$chunk]) {
+                if let Some(mask) = mask {
+                    let indices = _mm256_loadu_si256(mask.as_ptr().cast());
+                    c = _mm256_or_si256(c, _mm256_shuffle_epi8(*row, indices));
+                }
+            }
+
+            // Load zigzag-ordered correction, reciprocal, and scale tables
+            let corr: __m256i =
+                _mm256_loadu_si256(quant.corrections_zigzag.as_ptr().add(i) as *const __m256i);
+            let recip: __m256i =
+                _mm256_loadu_si256(quant.reciprocals_zigzag.as_ptr().add(i) as *const __m256i);
+            let scale: __m256i =
+                _mm256_loadu_si256(quant.scales_zigzag.as_ptr().add(i) as *const __m256i);
+
+            let abs_c: __m256i = _mm256_abs_epi16(c);
+            let corrected: __m256i = _mm256_add_epi16(abs_c, corr); // abs + correction
+            let step1: __m256i = _mm256_mulhi_epu16(corrected, recip); // * reciprocal >> 16
+            // Keep the second high multiply in 16-bit lanes.
+            let step2: __m256i;
+            core::arch::asm!(
+                "vpmulhuw {result}, {product}, {scale}",
+                result = lateout(ymm_reg) step2,
+                product = in(ymm_reg) step1,
+                scale = in(ymm_reg) scale,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+
+            // Restore sign: vpsignw(result, original) — zero stays zero, sign matched otherwise
+            let result: __m256i = _mm256_sign_epi16(step2, c);
+
+            _mm256_storeu_si256(output.as_mut_ptr().add(i) as *mut __m256i, result);
+        }};
+    }
+    quantize_chunk!(0);
+    quantize_chunk!(1);
+    quantize_chunk!(2);
+    quantize_chunk!(3);
 }
